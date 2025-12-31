@@ -13,6 +13,7 @@ from typing import Dict, Any
 from ttsizer.utils.logger import get_logger
 from ttsizer.asr_backends.parakeet_v2 import ParakeetV2Backend
 from ttsizer.asr_backends.gemini_asr import GeminiASRBackend
+from ttsizer.asr_backends.whisper_hinglish import WhisperHinglishBackend
 from ttsizer.asr_backends.base import ASRBackend, ASRResult
 
 logger = get_logger("asr_processor")
@@ -55,6 +56,9 @@ class ASRProcessor:
         if name in {"gemini"}:
             model_name = asr_config.get("gemini_model_name", "gemini-2.0-flash-lite")
             return GeminiASRBackend(model_name=model_name, api_key=asr_config.get("gemini_api_key"))
+        if name in {"whisper_hinglish"}:
+            model_name = asr_config.get("whisper_hinglish_model_name", "Oriserve/Whisper-Hindi2Hinglish-Prime")
+            return WhisperHinglishBackend(model_name=model_name, device=self.device)
         raise ValueError(f"Unknown ASR backend: {self.backend_name!r}")
 
     def _maybe_flag(

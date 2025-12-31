@@ -202,13 +202,10 @@ class PipelineOrchestrator:
         logger.info(f"\n--- Running Stage: {stage_key} ---")
         
         config = self._get_stage_cfg(stage_key)
-        if not config:
-            # Fallback to asr_processor config if segment_transcriber not defined
-            config = self._get_stage_cfg("asr_processor")
-        
         if not config: 
-            logger.warning(f"Skipping stage {stage_key} due to missing config (checked 'segment_transcriber' and 'asr_processor').")
-            return
+            msg = f"Configuration for stage '{stage_key}' is missing in the config file."
+            logger.error(msg)
+            raise ValueError(msg)
 
         # Input 1: JSONs from llm_diarizer (STAGES[3])
         llm_cfg = self._get_stage_cfg(STAGES[3])

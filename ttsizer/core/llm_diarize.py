@@ -181,9 +181,13 @@ class LLMDiarizer:
         if self.backend in {"pyannote", "pyannote_audio"}:
             from ttsizer.diarization_backends.pyannote_audio import PyannoteAudioDiarizer
 
+            hf_token = os.environ.get("HF_TOKEN")
+            if not hf_token:
+                raise ValueError("HF_TOKEN not found in environment variables")
+
             self._pyannote_backend = PyannoteAudioDiarizer(
                 model_name=diarizer_config.get("pyannote_model_name", "pyannote/speaker-diarization-3.1"),
-                hf_token=diarizer_config.get("hf_token"),
+                hf_token=hf_token,
                 device=diarizer_config.get("device", "cuda"),
                 num_speakers=diarizer_config.get("num_speakers"),
                 min_speakers=diarizer_config.get("min_speakers"),

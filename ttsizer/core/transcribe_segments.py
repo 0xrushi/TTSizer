@@ -8,22 +8,50 @@ from tqdm.auto import tqdm
 from typing import Dict, Any, List
 from ttsizer.utils.logger import get_logger
 from ttsizer.asr_backends.parakeet_v2 import ParakeetV2Backend
+from ttsizer.asr_backends.gemini_asr import GeminiASRBackend
+from ttsizer.asr_backends.whisper_hinglish import WhisperHinglishBackend
 
 logger = get_logger("segment_transcriber")
 
 class SegmentTranscriber:
     """
-    Transcribes audio segments defined in a JSON file using a local ASR model (Parakeet).
-    Used to fill in transcripts when diarization (e.g., Pyannote) only provides timestamps.
+    Transcribes audio segments defined in a JSON file using a local ASR model (Parakeet, Whisper) or API (Gemini).
+    
+    Goal:
+        To generate the initial transcripts for audio segments where they are missing.
+        
+    When it runs:
+        After the `LLMDiarizer` stage (Stage 4).
+        
+    Why it runs:
+        Some diarization methods (specifically the `pyannote_audio` backend in Stage 4) *only* detect 
+        who is speaking and when (timestamps), but they don't transcribe what is said. They leave the 
+        `transcript` field as `null`. `SegmentTranscriber` finds these "missing transcripts" 
+        (segments where `transcript` is empty or null) and uses an ASR model to fill them in.
+        
+    Context:
+        It operates on the full episode's audio, cutting out small chunks based on timestamps 
+        provided in the diarization JSONs to transcribe them.
     """
     def __init__(self, global_config: Dict[str, Any], asr_config: Dict[str, Any]):
         self.device = asr_config.get("device", "cuda")
-        self.model_name = asr_config.get("model_name", "nvidia/parakeet-tdt-0.6b-v2")
-        # Use a larger batch size for segments as they are short
-        self.batch_size = asr_config.get("batch_size", 16) 
+        self.batch_size = asr_config.get("batch_size", 16)
         
-        logger.info(f"Initializing SegmentTranscriber with {self.model_name} on {self.device}")
-        self.backend = ParakeetV2Backend(model_name=self.model_name, device=self.device)
+        backend_name = str(asr_config.get("backend", "parakeet_v2")).lower()
+        
+        logger.info(f"Initializing SegmentTranscriber with backend: {backend_name} on {self.device}")
+        
+        if backend_name in {"parakeet", "parakeet_v2", "nemo_parakeet"}:
+            model_name = asr_config.get("model_name", "nvidia/parakeet-tdt-0.6b-v2")
+            self.backend = ParakeetV2Backend(model_name=model_name, device=self.device)
+        elif backend_name in {"gemini"}:
+            model_name = asr_config.get("gemini_model_name", "gemini-2.0-flash-lite")
+            self.backend = GeminiASRBackend(model_name=model_name, api_key=asr_config.get("gemini_api_key"))
+        elif backend_name in {"whisper_hinglish", "whisper-hinglish", "whisper"}:
+            model_name = asr_config.get("whisper_hinglish_model_name", "Oriserve/Whisper-Hindi2Hinglish-Prime")
+            self.backend = WhisperHinglishBackend(model_name=model_name, device=self.device)
+        else:
+            raise ValueError(f"Unknown ASR backend: {backend_name!r}")
 
     def _time_to_sec(self, time_str: str) -> float:
         parts = time_str.split(':')
