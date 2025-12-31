@@ -2,6 +2,8 @@
 import yaml
 import os
 import sys
+import gc
+import torch
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 import logging
@@ -17,6 +19,7 @@ from ttsizer.core.llm_diarize import LLMDiarizer
 from ttsizer.core.ctc_align import CTCAligner
 from ttsizer.core.outlier_detect import OutlierDetector
 from ttsizer.core.asr_process import ASRProcessor
+from ttsizer.core.transcribe_segments import SegmentTranscriber
 from ttsizer.utils.logger import get_logger, initialize_logging
 
 logger: Optional[logging.Logger] = None
@@ -27,6 +30,7 @@ STAGES = [
     "vocals_extractor",
     "vocals_normalizer",
     "llm_diarizer",
+    "segment_transcriber",
     "ctc_aligner",
     "outlier_detector",
     "asr_processor"
@@ -73,9 +77,10 @@ class PipelineOrchestrator:
             STAGES[1]: self._run_vocals_extract,
             STAGES[2]: self._run_vocals_normalize,
             STAGES[3]: self._run_llm_diarize,
-            STAGES[4]: self._run_ctc_align,
-            STAGES[5]: self._run_outlier_detect,
-            STAGES[6]: self._run_asr_process,
+            STAGES[4]: self._run_segment_transcriber,
+            STAGES[5]: self._run_ctc_align,
+            STAGES[6]: self._run_outlier_detect,
+            STAGES[7]: self._run_asr_process,
         }
         
         self.pipeline_control = self.cfg.get("pipeline_control", {})
@@ -92,7 +97,7 @@ class PipelineOrchestrator:
         cfg = self.cfg.get(stage_key)
         if not cfg or not isinstance(cfg, dict):
             # Log a warning but proceed, stage run methods should handle missing config gracefully or error out.
-            logger.warning(f"Configuration for stage '{stage_key}' is missing or invalid in the config file.")
+            # logger.warning(f"Configuration for stage '{stage_key}' is missing or invalid in the config file.")
             return {}
         return cfg
 
@@ -113,6 +118,10 @@ class PipelineOrchestrator:
         
         current_output_folder = current_cfg.get("output_folder")
         if not current_output_folder:
+            # For segment_transcriber, we might not have an output folder in config as it edits in place
+            if current_stage_key == "segment_transcriber":
+                 return None, None 
+            
             # This is a critical error for a stage to function, so raise it.
             msg = f"Configuration for '{current_stage_key}' is missing 'output_folder'."
             logger.error(msg)
@@ -184,16 +193,44 @@ class PipelineOrchestrator:
         if not input_path: logger.error(f"Cannot run {stage_key}, input path from {STAGES[2]} is missing."); return
 
         diarizer = LLMDiarizer(self.cfg, config)
-        # diarizer.process_directory(input_path, output_path)
+        diarizer.process_directory(input_path, output_path)
+        logger.info(f"--- Stage {stage_key} complete ---")
+
+    def _run_segment_transcriber(self):
+        """Executes the segment transcription stage (filling empty transcripts)."""
+        stage_key = "segment_transcriber"
+        logger.info(f"\n--- Running Stage: {stage_key} ---")
+        
+        config = self._get_stage_cfg(stage_key)
+        if not config:
+            # Fallback to asr_processor config if segment_transcriber not defined
+            config = self._get_stage_cfg("asr_processor")
+        
+        if not config: 
+            logger.warning(f"Skipping stage {stage_key} due to missing config (checked 'segment_transcriber' and 'asr_processor').")
+            return
+
+        # Input 1: JSONs from llm_diarizer (STAGES[3])
+        llm_cfg = self._get_stage_cfg(STAGES[3])
+        json_dir = self.project_output_dir / llm_cfg["output_folder"]
+
+        # Input 2: Audio from vocals_normalizer (STAGES[2])
+        voc_cfg = self._get_stage_cfg(STAGES[2])
+        audio_dir = self.project_output_dir / voc_cfg["output_folder"]
+
+        transcriber = SegmentTranscriber(self.cfg, config)
+        transcriber.process_directory(json_dir, audio_dir)
         logger.info(f"--- Stage {stage_key} complete ---")
 
     def _run_ctc_align(self):
         """Executes the CTC forced alignment stage."""
-        stage_key = STAGES[4]
+        stage_key = STAGES[5]
         logger.info(f"\n--- Running Stage: {stage_key} ---")
         config = self._get_stage_cfg(stage_key)
         if not config: logger.warning(f"Skipping stage {stage_key} due to missing config."); return
 
+        # ctc_aligner still reads from llm_diarizer output (STAGES[3]), 
+        # as segment_transcriber (STAGES[4]) updates those files in place.
         transcriptions_input_path, output_path = self._get_stage_io_paths(stage_key, STAGES[3])
         if not transcriptions_input_path: logger.error(f"Cannot run {stage_key}, input path from {STAGES[3]} is missing."); return
 
@@ -211,20 +248,6 @@ class PipelineOrchestrator:
 
     def _run_outlier_detect(self):
         """Executes the outlier detection stage for speaker voice profiles."""
-        stage_key = STAGES[5]
-        logger.info(f"\n--- Running Stage: {stage_key} ---")
-        config = self._get_stage_cfg(stage_key)
-        if not config: logger.warning(f"Skipping stage {stage_key} due to missing config."); return
-
-        input_path, output_path = self._get_stage_io_paths(stage_key, STAGES[4])
-        if not input_path: logger.error(f"Cannot run {stage_key}, input path from {STAGES[4]} is missing."); return
-
-        detector = OutlierDetector(self.cfg, config)
-        detector.process_directory(input_path, output_path)
-        logger.info(f"--- Stage {stage_key} complete ---")
-
-    def _run_asr_process(self):
-        """Executes the ASR processing stage for final transcription and flagging."""
         stage_key = STAGES[6]
         logger.info(f"\n--- Running Stage: {stage_key} ---")
         config = self._get_stage_cfg(stage_key)
@@ -232,6 +255,20 @@ class PipelineOrchestrator:
 
         input_path, output_path = self._get_stage_io_paths(stage_key, STAGES[5])
         if not input_path: logger.error(f"Cannot run {stage_key}, input path from {STAGES[5]} is missing."); return
+
+        detector = OutlierDetector(self.cfg, config)
+        detector.process_directory(input_path, output_path)
+        logger.info(f"--- Stage {stage_key} complete ---")
+
+    def _run_asr_process(self):
+        """Executes the ASR processing stage for final transcription and flagging."""
+        stage_key = STAGES[7]
+        logger.info(f"\n--- Running Stage: {stage_key} ---")
+        config = self._get_stage_cfg(stage_key)
+        if not config: logger.warning(f"Skipping stage {stage_key} due to missing config."); return
+
+        input_path, output_path = self._get_stage_io_paths(stage_key, STAGES[6])
+        if not input_path: logger.error(f"Cannot run {stage_key}, input path from {STAGES[6]} is missing."); return
 
         processor = ASRProcessor(self.cfg, config)
         processor.process_directory(input_path, output_path) 
@@ -268,6 +305,12 @@ class PipelineOrchestrator:
             if stage_key in self.runners:
                 try:
                     self.runners[stage_key]()
+                    
+                    # Explicitly clear memory after each stage
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
                 except Exception as e:
                     logger.error(f"Error during execution of stage '{stage_key}': {e}", exc_info=True)
                     logger.error(f"Pipeline execution halted due to error in stage '{stage_key}'.")

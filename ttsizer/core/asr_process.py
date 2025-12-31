@@ -1,21 +1,24 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-import nemo.collections.asr as nemo_asr
 import soundfile as sf
 import torch
 from pathlib import Path
 from tqdm.auto import tqdm
 import numpy as np
+
 import shutil
 import yaml
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
 from ttsizer.utils.logger import get_logger
+from ttsizer.asr_backends.parakeet_v2 import ParakeetV2Backend
+from ttsizer.asr_backends.gemini_asr import GeminiASRBackend
+from ttsizer.asr_backends.base import ASRBackend, ASRResult
 
 logger = get_logger("asr_processor")
 
 class ASRProcessor:
-    """Processes audio files using a Parakeet ASR model for transcription and flagging.
+    """Processes audio files using an ASR backend for transcription and flagging.
 
     This class transcribes audio files, extracts word-level timestamps, and flags segments
     where the detected speech boundaries deviate significantly from the file boundaries.
@@ -29,11 +32,11 @@ class ASRProcessor:
             global_config: Dictionary containing global project setup information.
             asr_config: Dictionary containing configuration specific to the ASR processor.
         """
-        self.target_speakers = global_config['project_setup']['target_speaker_labels']
+        self.target_speakers = global_config['project_setup'].get('target_speaker_labels')
         
-        self.model_name = asr_config["model_name"]
         self.batch_size = asr_config["batch_size"]
         self.device = asr_config.get("device", 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.backend_name = str(asr_config.get("backend", "parakeet_v2"))
         
         self.time_thresh = asr_config["timestamp_deviation_threshold_sec"]
         self.padding = asr_config["padding_sec"]
@@ -41,40 +44,63 @@ class ASRProcessor:
         self.flagged_dir = asr_config["flagged_output_folder"]
         self.def_dir = "definite"
 
-        self.model = None
-        self._load_model()
-        logger.info("ParakeetASRProcessor initialized.")
+        self.backend: ASRBackend = self._load_backend(asr_config)
+        logger.info(f"ASRProcessor initialized with backend: {self.backend.name}")
 
-    def _load_model(self):
-        """Loads the pre-trained ASR model from Nemo."""
-        logger.info(f"Loading ASR model: {self.model_name}")
-        self.model = nemo_asr.models.ASRModel.from_pretrained(
-            model_name=self.model_name, 
-            map_location=self.device
-        )
-        self.model.eval()
+    def _load_backend(self, asr_config: Dict[str, Any]) -> ASRBackend:
+        name = self.backend_name.lower()
+        if name in {"parakeet", "parakeet_v2", "nemo_parakeet"}:
+            model_name = asr_config.get("model_name", "nvidia/parakeet-tdt-0.6b-v2")
+            return ParakeetV2Backend(model_name=model_name, device=self.device)
+        if name in {"gemini"}:
+            model_name = asr_config.get("gemini_model_name", "gemini-2.0-flash-lite")
+            return GeminiASRBackend(model_name=model_name, api_key=asr_config.get("gemini_api_key"))
+        raise ValueError(f"Unknown ASR backend: {self.backend_name!r}")
 
-    def _get_times(self, result: Any, dur: float) -> Tuple[float, float]:
-        """Extracts start and end times from ASR result word timestamps, clamped to duration.
+    def _maybe_flag(
+        self,
+        *,
+        audio: np.ndarray,
+        sr: int,
+        dur: float,
+        result: ASRResult,
+        out_audio_path: Path,
+        out_txt_path: Path,
+    ) -> bool:
+        if result.times is None:
+            return False
 
-        Args:
-            result: The ASR transcription result object, potentially containing timestamps.
-            dur: The total duration of the audio file in seconds.
+        start = float(result.times.start)
+        end = float(result.times.end)
+        start_dev = abs(start - 0.0)
+        end_dev = abs(end - dur)
+        if start_dev <= self.time_thresh and end_dev <= self.time_thresh:
+            return False
 
-        Returns:
-            A tuple (start_time, end_time) in seconds for the transcribed speech.
-        """
-        start, end = 0.0, dur
-        if hasattr(result, 'timestamp') and isinstance(result.timestamp, dict) and 'word' in result.timestamp:
-            words = result.timestamp['word']
-            valid = [s for s in words if isinstance(s, dict) and 'start' in s and 'end' in s]
-            if valid:
-                print("valid")
-                start = max(0.0, min(s['start'] for s in valid))
-                end = min(dur, max(s['end'] for s in valid))
-                if end < start:
-                    start, end = 0.0, dur
-        return start, end
+        pad_start = max(0.0, start - self.padding)
+        pad_end = min(dur, end + self.padding)
+        if pad_end <= pad_start:
+            if end > start:
+                pad_start, pad_end = start, end
+            else:
+                pad_start, pad_end = 0.0, dur
+
+        start_frame = int(pad_start * sr)
+        end_frame = int(pad_end * sr)
+        crop_audio = audio
+        if dur > 0 and end_frame > start_frame and start_frame >= 0 and end_frame <= len(audio):
+            crop_audio = audio[start_frame:end_frame]
+
+        if crop_audio.size == 0:
+            if audio.size > 0:
+                crop_audio = audio
+            else:
+                return False
+
+        sf.write(str(out_audio_path), crop_audio, sr, subtype='PCM_24')
+        with open(out_txt_path, 'w', encoding='utf-8') as f:
+            f.write(result.text)
+        return True
 
     def process_directory(self, input_dir: Path, output_dir: Path):
         """Processes all .wav files in speaker-specific subdirectories for ASR.
@@ -88,7 +114,12 @@ class ASRProcessor:
             output_dir: The base output directory where ASR results, including a
                         'flagged' subdirectory for each speaker, will be saved.
         """
-        for spkr in self.target_speakers:
+        speakers_to_process = self.target_speakers
+        if not speakers_to_process:
+            speakers_to_process = [d.name.replace("_", " ") for d in input_dir.iterdir() if d.is_dir()]
+            logger.info(f"Auto-discovered {len(speakers_to_process)} speakers from {input_dir}")
+
+        for spkr in speakers_to_process:
             spkr_dir = spkr.replace(" ", "_")
             
             in_dir = input_dir / spkr_dir / self.def_dir
@@ -113,22 +144,12 @@ class ASRProcessor:
                 batch_files = files[i:i + self.batch_size]
 
                 try:
-                    results = self.model.transcribe(
-                        batch,
-                        batch_size=len(batch),
-                        timestamps=True,
-                        verbose=False
-                    )
+                    results = self.backend.transcribe_batch(batch)
                 except Exception as e:
                     logger.error(f"Error in batch: {e}")
                     continue
 
-                if isinstance(results, tuple) and len(results) == 1 and isinstance(results[0], list):
-                    results = results[0]
-                elif not isinstance(results, list):
-                    continue
-
-                if len(results) != len(batch_files):
+                if not isinstance(results, list) or len(results) != len(batch_files):
                     continue
 
                 for path, result in zip(batch_files, results):
@@ -137,48 +158,17 @@ class ASRProcessor:
                         if audio.ndim > 1:
                             audio = np.mean(audio, axis=1)
                         dur = len(audio) / sr if sr > 0 else 0.0
-                        
-                        text = ""
-                        start, end = 0.0, dur
 
-                        if isinstance(result, str):
-                            text = result
-                        elif hasattr(result, 'text'):
-                            text = result.text or ""
-                            start, end = self._get_times(result, dur)
-
-                        # Check if needs flagging
-                        start_dev = abs(start - 0.0)
-                        end_dev = abs(end - dur)
-                        
-                        if start_dev > self.time_thresh or end_dev > self.time_thresh:
-                            pad_start = max(0.0, start - self.padding)
-                            pad_end = min(dur, end + self.padding)
-                            
-                            if pad_end <= pad_start:
-                                if end > start:
-                                    pad_start, pad_end = start, end
-                                else:
-                                    pad_start, pad_end = 0.0, dur
-
-                            start_frame = int(pad_start * sr)
-                            end_frame = int(pad_end * sr)
-
-                            crop_audio = audio
-                            if dur > 0 and end_frame > start_frame and start_frame >= 0 and end_frame <= len(audio):
-                                crop_audio = audio[start_frame:end_frame]
-                            
-                            if crop_audio.size == 0:
-                                if audio.size > 0:
-                                    crop_audio = audio
-                                else:
-                                    continue
-                            
-                            flagged_audio = flagged_dir / path.name
-                            flagged_txt = flagged_dir / path.with_suffix(".txt").name
-                            sf.write(str(flagged_audio), crop_audio, sr, subtype='PCM_24')
-                            with open(flagged_txt, 'w', encoding='utf-8') as f:
-                                f.write(text)
+                        flagged_audio = flagged_dir / path.name
+                        flagged_txt = flagged_dir / path.with_suffix(".txt").name
+                        if self._maybe_flag(
+                            audio=audio,
+                            sr=sr,
+                            dur=dur,
+                            result=result,
+                            out_audio_path=flagged_audio,
+                            out_txt_path=flagged_txt,
+                        ):
                             flagged += 1
                     
                     except Exception as e:

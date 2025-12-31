@@ -177,7 +177,14 @@ def demix(
         - A numpy array of the separated source if only one instrument is present.
     """
 
-    mix = torch.tensor(mix, dtype=torch.float32)
+    if isinstance(mix, torch.Tensor):
+        mix = mix.detach()
+        if mix.device.type != "cpu":
+            mix = mix.to("cpu")
+        if mix.dtype != torch.float32:
+            mix = mix.to(dtype=torch.float32)
+    else:
+        mix = torch.tensor(mix, dtype=torch.float32)
 
     if model_type == 'htdemucs':
         mode = 'demucs'

@@ -8,6 +8,7 @@ from typing import Dict, Any
 import torch.nn as nn
 from ml_collections import ConfigDict
 from pathlib import Path
+import time
 
 from ttsizer.models.bs_roformer import MelBandRoformer
 from ttsizer.utils.vocal_utils import demix
@@ -41,6 +42,7 @@ class VocalsExtractor:
         self.out_fmt = config["output_format"].lower()
         self.pcm_type = config["output_pcm_type"]
         self.skip_existing = config.get("skip_if_output_exists", True)
+        self.show_chunk_progress = bool(config.get("show_chunk_progress", False))
         
         self.out_dir = None
         self.model_cfg = None
@@ -85,6 +87,7 @@ class VocalsExtractor:
         else:
             self.device = torch.device('cpu')
         self.model.to(self.device)
+        logger.info(f"Using device: {self.device}")
 
     def _prepare_audio(self, mix: np.ndarray) -> np.ndarray:
         """Prepares the input audio mix to match model's expected channel format.
@@ -118,11 +121,11 @@ class VocalsExtractor:
             mix = librosa.resample(mix, orig_sr=sr, target_sr=self.target_sr, res_type='kaiser_best')
         
         mix = self._prepare_audio(mix)
-        mix_tensor = torch.tensor(mix, dtype=torch.float32).to(self.device)
+        mix_tensor = torch.tensor(mix, dtype=torch.float32)
         
         with torch.no_grad():
             stems = demix(self.model_cfg, self.model, mix_tensor, self.device,
-                         model_type=self.model_type, pbar=False)
+                         model_type=self.model_type, pbar=self.show_chunk_progress)
         
         target = self.model_cfg.training.get('target_instrument', 'vocals')
         vocal_key = target if target in stems else 'vocals' if 'vocals' in stems else None
@@ -176,16 +179,27 @@ class VocalsExtractor:
         skipped = 0
         processed = 0
 
-        for path in tqdm(files, desc="Extracting vocals", unit="file"):
-            out_name = f"{path.stem}_vocals.{self.out_fmt}"
-            out_path = self.out_dir / out_name
+        total = len(files)
+        with tqdm(files, desc="Extracting vocals", unit="file") as pbar:
+            for idx, path in enumerate(pbar, start=1):
+                pbar.set_postfix_str(path.name, refresh=True)
+                out_name = f"{path.stem}_vocals.{self.out_fmt}"
+                out_path = self.out_dir / out_name
 
-            if self.skip_existing and out_path.exists():
-                skipped += 1
-                continue
-            
-            self._process_file(path)
-            processed += 1
+                if self.skip_existing and out_path.exists():
+                    skipped += 1
+                    continue
+
+                start = time.perf_counter()
+                logger.info(f"Processing file {idx}/{total}: {path.name}")
+                try:
+                    self._process_file(path)
+                    processed += 1
+                except Exception as e:
+                    logger.exception(f"Failed processing {path.name}: {type(e).__name__}: {e}")
+                finally:
+                    elapsed = time.perf_counter() - start
+                    logger.info(f"Finished {path.name} in {elapsed:.1f}s")
 
         logger.info(f"Done: {processed} processed, {skipped} skipped")
 

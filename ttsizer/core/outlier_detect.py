@@ -17,6 +17,25 @@ from ttsizer.utils.logger import get_logger
 
 logger = get_logger("outlier_detector")
 
+class GPUWrapper(torch.nn.Module):
+    """Wraps a model to ensure inputs are on the correct device."""
+    def __init__(self, model, device):
+        super().__init__()
+        self.model = model
+        self.device = device
+
+    def forward(self, x):
+        if isinstance(x, torch.Tensor):
+            x = x.to(self.device)
+        return self.model(x)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
+
+
 class OutlierDetector:
     """Detects and moves audio clips that deviate from a target speaker's voice profile.
 
@@ -33,7 +52,7 @@ class OutlierDetector:
             global_config: Dictionary containing global project setup information.
             outlier_config: Dictionary containing configuration specific to the outlier detector.
         """
-        self.target_speakers = global_config['project_setup']['target_speaker_labels']
+        self.target_speakers = global_config['project_setup'].get('target_speaker_labels') or []
         
         self.sr = outlier_config["target_sample_rate"]
         self.use_gpu = outlier_config["use_gpu"]
@@ -54,8 +73,44 @@ class OutlierDetector:
 
     def _load_model(self):
         """Loads the speaker embedding model using wespeaker."""
-        model = wespeaker.load_model_local(str(self.model_path))
-        model.set_device("cuda" if self.use_gpu and torch.cuda.is_available() else "cpu")
+        model_path = str(self.model_path)
+        loader = getattr(wespeaker, "load_model_local", None) or getattr(wespeaker, "load_model", None)
+        if loader is None:
+            raise AttributeError(
+                "wespeaker does not provide a compatible model loader. Expected `load_model` or `load_model_local`."
+            )
+
+        model = loader(model_path)
+
+        device = "cpu"
+        if self.use_gpu:
+            try:
+                if torch.cuda.device_count() > 0:
+                    # Force a small CUDA allocation to ensure CUDA is actually usable.
+                    torch.empty(1, device="cuda")
+                    device = "cuda"
+            except Exception as e:
+                logger.warning(
+                    f"CUDA unavailable for wespeaker; falling back to CPU ({type(e).__name__}: {e})."
+                )
+        if hasattr(model, "set_device"):
+            try:
+                model.set_device(device)
+                # Monkey-patch the internal model to handle device placement if on GPU
+                if device == "cuda" and hasattr(model, "model"):
+                    model.model = GPUWrapper(model.model, torch.device("cuda"))
+                    logger.info("Applied GPUWrapper to wespeaker model.")
+            except Exception as e:
+                logger.warning(f"Failed to set wespeaker device to {device}: {type(e).__name__}: {e}; using cpu.")
+                model.set_device("cpu")
+        else:
+            logger.warning("Loaded wespeaker model without `set_device`; embeddings may run on the default device.")
+
+        if not hasattr(model, "extract_embedding"):
+            raise TypeError(
+                "Loaded wespeaker model does not expose `extract_embedding`. "
+                "Ensure you're using `wespeaker.load_model(...)` with a compatible model directory."
+            )
         return model
 
     def _get_embedding(self, path: Path) -> Optional[np.ndarray]:
@@ -94,8 +149,29 @@ class OutlierDetector:
                 tmp_file = Path(f.name)
             sf.write(str(tmp_file), sig.squeeze().cpu().numpy(), self.sr, subtype='PCM_16')
             path_for_emb = str(tmp_file)
-        
-        emb = self.model.extract_embedding(path_for_emb)
+
+        try:
+            emb = self.model.extract_embedding(path_for_emb)
+        except RuntimeError as e:
+            msg = str(e)
+            if "Input type" in msg and "weight type" in msg and hasattr(self.model, "set_device"):
+                logger.warning(
+                    f"wespeaker device mismatch for {path.name}; retrying on CPU ({type(e).__name__}: {e})"
+                )
+                try:
+                    self.model.set_device("cpu")
+                    emb = self.model.extract_embedding(path_for_emb)
+                except Exception as e2:
+                    logger.warning(
+                        f"wespeaker embedding failed for {path.name} after CPU retry: {type(e2).__name__}: {e2}"
+                    )
+                    emb = None
+            else:
+                logger.warning(f"wespeaker embedding failed for {path.name}: {type(e).__name__}: {e}")
+                emb = None
+        except Exception as e:
+            logger.warning(f"wespeaker embedding failed for {path.name}: {type(e).__name__}: {e}")
+            emb = None
         
         if tmp_file and tmp_file.exists():
             tmp_file.unlink()
@@ -121,8 +197,14 @@ class OutlierDetector:
         """
         data = {}
         
+        speakers_to_process = self.target_speakers
+        if not speakers_to_process:
+            # Auto-discover: assume directory names are "Speaker_Name" -> "Speaker Name"
+            speakers_to_process = [d.name.replace("_", " ") for d in in_dir.iterdir() if d.is_dir()]
+            logger.info(f"Auto-discovered {len(speakers_to_process)} speakers from {in_dir}")
+
         # Process each target speaker
-        for spkr in self.target_speakers:
+        for spkr in speakers_to_process:
             # Convert speaker name to directory format
             spkr_dir = spkr.replace(" ", "_")
             src_dir = in_dir / spkr_dir
@@ -299,10 +381,15 @@ class OutlierDetector:
             out_dir: The base output directory where outlier detection results will be stored,
                      with subdirectories for each speaker and their categories.
         """
+        data = self._setup_dirs(in_dir, out_dir)
+        if not data:
+            logger.warning(f"No speaker directories found under {in_dir}")
+            return
+
+        speakers = self.target_speakers or sorted(data.keys())
+
         # Process each speaker
-        for spkr in self.target_speakers:
-            data = self._setup_dirs(in_dir, out_dir)
-            
+        for spkr in speakers:
             if spkr not in data:
                 continue
 

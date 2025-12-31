@@ -35,7 +35,7 @@ class CTCAligner:
             aligner_config: Dictionary containing configuration specific to the CTC aligner.
         """
         proj = global_config["project_setup"]
-        self.target_spkrs = proj["target_speaker_labels"]
+        self.target_spkrs = proj.get("target_speaker_labels")
 
         self.model_path = aligner_config["model_name"]
         self.lang = aligner_config["language_code"]
@@ -46,6 +46,10 @@ class CTCAligner:
         self.end_pad = aligner_config["end_pad_seconds"]
         self.min_words = aligner_config["min_words_per_segment"]
         self.min_duration = aligner_config["min_duration_seconds_segment"]
+        self.min_clip_duration = aligner_config.get("min_clip_duration_seconds")
+        self.max_clip_duration = aligner_config.get("max_clip_duration_seconds")
+        self.allow_timestamp_only = bool(aligner_config.get("allow_timestamp_only_segments", False))
+        self.timestamp_only_min_duration = float(aligner_config.get("timestamp_only_min_duration_seconds", 0.75))
         
         self.out_fmt = aligner_config.get("output_audio_format", "wav").lower()
         self.out_subtype = aligner_config.get("output_audio_subtype", "PCM_24")
@@ -117,13 +121,36 @@ class CTCAligner:
         if wf is None or wf.nelement() == 0:
             return None
 
-        with torch.no_grad():
-            emissions, stride = generate_emissions(self.model, wf, batch_size=self.batch_size)
-        
-        tokens, text_s = preprocess_text(text, romanize=True, language=self.lang, split_size='word', star_frequency='edges')
-        segments, scores, blank = get_alignments(emissions, tokens, self.tokenizer)
-        spans = get_spans(tokens, segments, blank)
-        word_ts = postprocess_results(text_s, spans, stride, scores)
+        try:
+            with torch.no_grad():
+                emissions, stride = generate_emissions(self.model, wf, batch_size=self.batch_size)
+
+            tokens, text_s = preprocess_text(
+                text,
+                romanize=True,
+                language=self.lang,
+                split_size="word",
+                star_frequency="edges",
+            )
+            # The upstream `ctc_forced_aligner` library optionally injects a `<star>` token
+            # to improve alignment on some pipelines. HuggingFace CTC models do not have a
+            # `<star>` class in their logits, so we must remove it before alignment.
+            if tokens and text_s:
+                filtered_tokens = []
+                filtered_text = []
+                for tok, chunk in zip(tokens, text_s):
+                    if tok == "<star>":
+                        continue
+                    filtered_tokens.append(tok)
+                    filtered_text.append(chunk)
+                tokens, text_s = filtered_tokens, filtered_text
+
+            segments, scores, blank = get_alignments(emissions, tokens, self.tokenizer)
+            spans = get_spans(tokens, segments, blank)
+            word_ts = postprocess_results(text_s, spans, stride, scores)
+        except Exception as e:
+            logger.warning(f"CTC alignment failed for {audio_path.name}: {type(e).__name__}: {e}")
+            return None
 
         first = next((seg for seg in word_ts if seg.get('text') and seg['text'] != '<star>'), None)
         last = next((seg for seg in reversed(word_ts) if seg.get('text') and seg['text'] != '<star>'), None)
@@ -183,14 +210,14 @@ class CTCAligner:
 
         # Basic validation
         if not (spkr and start_str and end_str): return False, False, False 
-        if spkr not in self.target_spkrs: return False, False, False 
+        if self.target_spkrs and spkr not in self.target_spkrs: return False, False, False 
 
         t0 = self._time_to_sec(start_str)
         t1 = self._time_to_sec(end_str)
         if t1 <= t0: return False, False, False
         
         duration = t1 - t0
-        is_expr = transcript.startswith(('(', '[')) and transcript.endswith((')', ']'))
+        is_expr = isinstance(transcript, str) and transcript.startswith(('(', '[')) and transcript.endswith((')', ']'))
         
         start_sec, end_sec = -1.0, -1.0
         align_err = False
@@ -201,8 +228,12 @@ class CTCAligner:
             start_sec, end_sec = t0, t1
         else:
             text = text.strip()
-            if not text or len(text.split()) < self.min_words: return False, False, False
-            if duration < self.min_duration: return False, False, False
+            if not text or len(text.split()) < self.min_words or duration < self.min_duration:
+                if self.allow_timestamp_only and duration >= self.timestamp_only_min_duration:
+                    start_sec, end_sec = t0, t1
+                    text = ""
+                else:
+                    return False, False, False
             
             # Initial padded crop for alignment
             t0_pad = max(0.0, t0 - self.start_pad)
@@ -221,22 +252,34 @@ class CTCAligner:
             temp_path = temp_dir / f"temp_{self._clean_name(spkr)}_{counters.get(spkr,0)}_{t0:.3f}.wav"
             sf.write(str(temp_path), chunk, sr)
 
-            # Align
-            times = self._get_timestamps(temp_path, text)
-            if temp_path.exists(): temp_path.unlink(missing_ok=True) # Clean up temp wav
+            if text:
+                # Align
+                times = self._get_timestamps(temp_path, text)
+                if temp_path.exists(): temp_path.unlink(missing_ok=True) # Clean up temp wav
 
-            if times is None:
-                align_err = True
-                return False, False, align_err
+                if times is None:
+                    align_err = True
+                    return False, False, align_err
 
-            rel_start, rel_end = times
-            start_sec = t0_pad + rel_start
-            end_sec = t0_pad + rel_end
+                rel_start, rel_end = times
+                start_sec = t0_pad + rel_start
+                end_sec = t0_pad + rel_end
+            else:
+                # Timestamp-only fallback (no forced alignment)
+                if temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                start_sec, end_sec = t0, t1
 
         # Final Cropping and Saving
         sr = audio_info.samplerate
         i0, i1 = math.floor(start_sec * sr), math.ceil(end_sec * sr)
         if i1 <= i0: return False, False, align_err
+
+        clip_dur = (i1 - i0) / sr if sr > 0 else 0.0
+        if self.min_clip_duration is not None and clip_dur < float(self.min_clip_duration):
+            return False, False, align_err
+        if self.max_clip_duration is not None and clip_dur > float(self.max_clip_duration):
+            return False, False, align_err
 
         final_chunk = audio[i0:i1]
         if final_chunk.size == 0: return False, False, align_err
@@ -315,7 +358,11 @@ class CTCAligner:
         """
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        json_files = sorted(list(json_dir.glob("*.json")))
+        json_files = sorted(
+            p
+            for p in json_dir.glob("*.json")
+            if not p.name.endswith(".uploaded.json")
+        )
         if not json_files:
             logger.warning(f"No JSON files found in {json_dir}")
             return
