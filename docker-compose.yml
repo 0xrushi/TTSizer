@@ -1,0 +1,29 @@
+services:
+  ttsizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ttsizer:latest
+    container_name: ttsizer
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - .:/app
+      - /mnt/sdc3/data:/data
+    ports:
+      - "8888:8888"
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+
+  test:
+    image: ttsizer:latest
+    container_name: ttsizer-test
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - .:/app
+      - /mnt/sdc3/data:/data
+    command: uv run pytest -vv tests/
