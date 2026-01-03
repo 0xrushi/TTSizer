@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 import torchaudio
+import soundfile as sf
+import numpy as np
 from hyperpyyaml import load_hyperpyyaml
 from speechbrain.inference.speaker import EncoderClassifier
 from speechbrain.utils.distributed import run_on_main
@@ -25,7 +27,16 @@ def _list_wavs_recursive(root: Path) -> list[Path]:
 
 
 def _load_audio(path: Path, target_sr: int, resamplers: dict[int, torchaudio.transforms.Resample]) -> torch.Tensor:
-    wav, sr = torchaudio.load(str(path))
+    # Use soundfile directly as torchaudio.load caused crashes on some systems
+    data, sr = sf.read(str(path), dtype='float32')
+    wav = torch.from_numpy(data)
+    
+    # Ensure (channels, time) format
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
+    else:
+        wav = wav.t()
+        
     if wav.ndim > 1:
         wav = wav.mean(dim=0, keepdim=True)
     if sr != target_sr:
@@ -123,11 +134,7 @@ def _load_classifier(
         filename="hyperparams.yaml",
         source=model_source,
         savedir=None,
-        overwrite=False,
         save_filename=None,
-        use_auth_token=False,
-        revision=None,
-        huggingface_cache_dir=None,
         local_strategy=LocalStrategy.SYMLINK,
     )
     with open(hparams_local_path, encoding="utf-8") as handle:
@@ -140,7 +147,6 @@ def _load_classifier(
             pretrainer.collect_files,
             kwargs={
                 "default_source": model_source,
-                "use_auth_token": False,
                 "local_strategy": LocalStrategy.SYMLINK,
             },
         )
@@ -150,10 +156,7 @@ def _load_classifier(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Clean diarized speaker clips using speaker verification. "
-        "Supports three modes: single-speaker, multi-speaker, and brute-force."
-    )
+    parser = argparse.ArgumentParser(description="Clean diarized speaker clips using speaker verification.")
     parser.add_argument(
         "--final-dir",
         type=Path,
@@ -264,11 +267,16 @@ def main() -> int:
 
         gold_embs: list[torch.Tensor] = []
         for wav_path in gold_files:
-            wav = _load_audio(wav_path, args.sample_rate, resamplers)
-            duration, rms_db, active_ratio = _measure_signal(wav, args.sample_rate, args.min_rms_db)
-            if duration < args.min_sec or rms_db < args.min_rms_db or active_ratio < args.min_active_ratio:
+            print(f"DEBUG: Processing gold file {wav_path}", flush=True)
+            try:
+                wav = _load_audio(wav_path, args.sample_rate, resamplers)
+                duration, rms_db, active_ratio = _measure_signal(wav, args.sample_rate, args.min_rms_db)
+                if duration < args.min_sec or rms_db < args.min_rms_db or active_ratio < args.min_active_ratio:
+                    continue
+                gold_embs.append(_embed(wav, classifier, device))
+            except Exception as e:
+                print(f"ERROR processing {wav_path}: {e}", flush=True)
                 continue
-            gold_embs.append(_embed(wav, classifier, device))
 
         if not gold_embs:
             print(f"[WARN] No usable gold embeddings after filtering in: {gold_dir}")
@@ -366,11 +374,16 @@ def main() -> int:
 
         gold_embs: list[torch.Tensor] = []
         for wav_path in gold_files:
-            wav = _load_audio(wav_path, args.sample_rate, resamplers)
-            duration, rms_db, active_ratio = _measure_signal(wav, args.sample_rate, args.min_rms_db)
-            if duration < args.min_sec or rms_db < args.min_rms_db or active_ratio < args.min_active_ratio:
+            print(f"DEBUG: Processing gold file {wav_path}", flush=True)
+            try:
+                wav = _load_audio(wav_path, args.sample_rate, resamplers)
+                duration, rms_db, active_ratio = _measure_signal(wav, args.sample_rate, args.min_rms_db)
+                if duration < args.min_sec or rms_db < args.min_rms_db or active_ratio < args.min_active_ratio:
+                    continue
+                gold_embs.append(_embed(wav, classifier, device))
+            except Exception as e:
+                print(f"ERROR processing {wav_path}: {e}", flush=True)
                 continue
-            gold_embs.append(_embed(wav, classifier, device))
 
         if not gold_embs:
             raise SystemExit(f"No usable gold embeddings after filtering in: {gold_dir}")
@@ -390,49 +403,54 @@ def main() -> int:
                 continue
 
             for wav_path in cand_files:
-                total += 1
-                wav = _load_audio(wav_path, args.sample_rate, resamplers)
-                duration, rms_db, active_ratio = _measure_signal(wav, args.sample_rate, args.min_rms_db)
-                if duration < args.min_sec or rms_db < args.min_rms_db or active_ratio < args.min_active_ratio:
+                print(f"DEBUG: Processing candidate file {wav_path}", flush=True)
+                try:
+                    total += 1
+                    wav = _load_audio(wav_path, args.sample_rate, resamplers)
+                    duration, rms_db, active_ratio = _measure_signal(wav, args.sample_rate, args.min_rms_db)
+                    if duration < args.min_sec or rms_db < args.min_rms_db or active_ratio < args.min_active_ratio:
+                        rel_path = wav_path.relative_to(final_dir).as_posix()
+                        report_rows.append(
+                            {
+                                "speaker_id": gold_speaker_id,
+                                "relative_path": rel_path,
+                                "similarity": "",
+                                "decision": "filtered",
+                                "reason": "silence_or_short",
+                                "duration_sec": f"{duration:.3f}",
+                                "rms_db": f"{rms_db:.2f}",
+                                "active_ratio": f"{active_ratio:.3f}",
+                            }
+                        )
+                        skipped += 1
+                        continue
+                    emb = _embed(wav, classifier, device)
+                    similarity = float(torch.dot(emb, gold_mean))
+                    if similarity >= args.threshold:
+                        _copy_pair(wav_path, output_dir)
+                        kept += 1
+                        decision = "kept"
+                        reason = ""
+                    else:
+                        skipped += 1
+                        decision = "rejected"
+                        reason = "below_threshold"
                     rel_path = wav_path.relative_to(final_dir).as_posix()
                     report_rows.append(
                         {
                             "speaker_id": gold_speaker_id,
                             "relative_path": rel_path,
-                            "similarity": "",
-                            "decision": "filtered",
-                            "reason": "silence_or_short",
+                            "similarity": f"{similarity:.4f}",
+                            "decision": decision,
+                            "reason": reason,
                             "duration_sec": f"{duration:.3f}",
                             "rms_db": f"{rms_db:.2f}",
                             "active_ratio": f"{active_ratio:.3f}",
                         }
                     )
-                    skipped += 1
+                except Exception as e:
+                    print(f"ERROR processing candidate {wav_path}: {e}", flush=True)
                     continue
-                emb = _embed(wav, classifier, device)
-                similarity = float(torch.dot(emb, gold_mean))
-                if similarity >= args.threshold:
-                    _copy_pair(wav_path, output_dir)
-                    kept += 1
-                    decision = "kept"
-                    reason = ""
-                else:
-                    skipped += 1
-                    decision = "rejected"
-                    reason = "below_threshold"
-                rel_path = wav_path.relative_to(final_dir).as_posix()
-                report_rows.append(
-                    {
-                        "speaker_id": gold_speaker_id,
-                        "relative_path": rel_path,
-                        "similarity": f"{similarity:.4f}",
-                        "decision": decision,
-                        "reason": reason,
-                        "duration_sec": f"{duration:.3f}",
-                        "rms_db": f"{rms_db:.2f}",
-                        "active_ratio": f"{active_ratio:.3f}",
-                    }
-                )
 
         print(f"Brute force mode: processed {total} files from all speakers, kept {kept}, skipped {skipped}")
         _write_report(report_csv, report_rows)
