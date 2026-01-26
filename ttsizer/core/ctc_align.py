@@ -7,6 +7,9 @@ import re
 import math
 from collections import defaultdict
 from typing import Dict, Optional, Tuple, Any
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import traceback
 from tqdm.auto import tqdm
 import numpy as np
 from pathlib import Path
@@ -19,6 +22,28 @@ from ctc_forced_aligner import (generate_emissions, get_alignments, get_spans,
                                postprocess_results, preprocess_text, load_audio)
 
 logger = get_logger("ctc_aligner")
+
+def _ctc_worker_initializer(global_config: Dict[str, Any], aligner_config: Dict[str, Any]):
+    multiprocessing.current_process().ctc_aligner = CTCAligner(  # type: ignore[attr-defined]
+        global_config=global_config,
+        aligner_config=aligner_config,
+    )
+
+def _ctc_process_episode_worker(
+    json_path: str,
+    audio_path: str,
+    ep_name: str,
+    out_dir: str,
+) -> Tuple[str, int, int, int, int]:
+    aligner = multiprocessing.current_process().ctc_aligner  # type: ignore[attr-defined]
+    vocals, sounds, errors, segments = aligner._process_episode(  # noqa: SLF001
+        Path(json_path),
+        Path(audio_path),
+        ep_name,
+        Path(out_dir),
+        show_progress=False,
+    )
+    return ep_name, vocals, sounds, errors, segments
 
 class CTCAligner:
     """Aligns audio segments with their transcripts using CTC forced alignment.
@@ -37,10 +62,15 @@ class CTCAligner:
         proj = global_config["project_setup"]
         self.target_spkrs = proj.get("target_speaker_labels")
 
+        # Keep original configs for multiprocessing workers.
+        self._global_config = global_config
+        self._aligner_config = aligner_config
+
         self.model_path = aligner_config["model_name"]
         self.lang = aligner_config["language_code"]
         self.batch_size = aligner_config["batch_size"]
         self.use_gpu = aligner_config["use_gpu"]
+        self.num_workers = max(1, int(aligner_config.get("num_workers", 1) or 1))
         
         self.start_pad = aligner_config["start_pad_seconds"]
         self.end_pad = aligner_config["end_pad_seconds"]
@@ -296,7 +326,13 @@ class CTCAligner:
         return not is_expr, is_expr, align_err
 
     def _process_episode(
-        self, json_path: Path, audio_path: Path, ep_name: str, out_dir: Path
+        self,
+        json_path: Path,
+        audio_path: Path,
+        ep_name: str,
+        out_dir: Path,
+        *,
+        show_progress: bool = True,
     ) -> Tuple[int, int, int, int]:
         """Processes all segments for a single episode (JSON and audio file pair).
 
@@ -331,7 +367,12 @@ class CTCAligner:
             vocal_count = sound_count = 0
             align_errors = 0
 
-            for seg in tqdm(segments, desc="Processing Segments", unit="segment"):
+            for seg in tqdm(
+                segments,
+                desc="Processing Segments",
+                unit="segment",
+                disable=not show_progress,
+            ):
                 is_vocal, is_expr, has_error = self._process_segment(
                     seg, audio, info, out_dir, temp_dir, counters, ep_name
                 )
@@ -345,7 +386,7 @@ class CTCAligner:
         return vocal_count, sound_count, align_errors, len(segments)
 
     def process_directory(
-        self, json_dir: Path, audio_dir: str, out_dir: Path):
+        self, json_dir: Path, audio_dir: Path, out_dir: Path):
         """Processes all JSON transcript files in a directory for CTC alignment.
 
         Finds corresponding audio files for each JSON, then processes each episode.
@@ -370,7 +411,9 @@ class CTCAligner:
         logger.info(f"Found {len(json_files)} transcription json files in {json_dir}")
 
         total_vocals = total_sounds = total_errors = total_segments = 0
-        for json_path in tqdm(json_files, desc="Processing Episodes", unit="episode"):
+
+        episode_jobs: list[tuple[Path, Path, str]] = []
+        for json_path in json_files:
             ep_name = json_path.stem
             audio_path = None
             for fmt in ['.flac', '.wav']:
@@ -383,13 +426,57 @@ class CTCAligner:
                 logger.warning(f"No audio file found for {ep_name}")
                 continue
 
-            vocals, sounds, errors, segments = self._process_episode(
-                json_path, audio_path, ep_name, out_dir
-            )
-            total_vocals += vocals
-            total_sounds += sounds
-            total_errors += errors
-            total_segments += segments
+            episode_jobs.append((json_path, audio_path, ep_name))
+
+        if self.num_workers <= 1:
+            for json_path, audio_path, ep_name in tqdm(episode_jobs, desc="Processing Episodes", unit="episode"):
+                vocals, sounds, errors, segments = self._process_episode(
+                    json_path,
+                    audio_path,
+                    ep_name,
+                    out_dir,
+                    show_progress=True,
+                )
+                total_vocals += vocals
+                total_sounds += sounds
+                total_errors += errors
+                total_segments += segments
+        else:
+            logger.info(f"Processing {len(episode_jobs)} episodes with {self.num_workers} parallel worker processes")
+            logger.info("Each worker loads its own CTC model copy on the GPU (higher VRAM use, higher throughput)")
+
+            mp_ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(
+                max_workers=self.num_workers,
+                mp_context=mp_ctx,
+                initializer=_ctc_worker_initializer,
+                initargs=(self._global_config, self._aligner_config),
+            ) as executor:
+                future_to_ep = {
+                    executor.submit(
+                        _ctc_process_episode_worker,
+                        str(json_path),
+                        str(audio_path),
+                        ep_name,
+                        str(out_dir),
+                    ): ep_name
+                    for json_path, audio_path, ep_name in episode_jobs
+                }
+
+                with tqdm(total=len(episode_jobs), desc="Processing Episodes", unit="episode") as pbar:
+                    for future in as_completed(future_to_ep):
+                        ep_name = future_to_ep[future]
+                        try:
+                            _, vocals, sounds, errors, segments = future.result()
+                            total_vocals += vocals
+                            total_sounds += sounds
+                            total_errors += errors
+                            total_segments += segments
+                        except Exception as e:
+                            logger.error(f"Worker process error for {ep_name}: {type(e).__name__}: {e}")
+                            logger.debug(traceback.format_exc())
+                        finally:
+                            pbar.update(1)
 
         logger.info(f"\n=== Alignment Summary ===")
         logger.info(f"Total Segments: {total_segments}")

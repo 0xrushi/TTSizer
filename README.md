@@ -66,6 +66,103 @@ project_setup:
 python -m ttsizer.main
 ```
 
+## 🎤 Finetuning & Inference Scripts
+
+In addition to the main dataset generation pipeline, TTSizer includes scripts for finetuning Spark-TTS models and generating speech using the trained models.
+
+### Finetuning Script (`finetune.py`)
+
+**Purpose**: Fine-tune the Spark-TTS (0.5B) model on a custom audio dataset.
+
+**How to run**:
+```bash
+python finetune.py
+```
+
+**What it does**:
+- Loads a local AudioFolder dataset (default: `tts_dataset_output`)
+- Uses unsloth for optimized LoRA training
+- Trains the model on speaker-specific data
+- Saves LoRA adapters to `tts_lora/` directory
+- Outputs intermediate checkpoints to `outputs_tts/`
+
+**Configuration**:
+Edit the following variables in the script:
+- `dataset_path`: Path to your AudioFolder dataset with `transcription` field
+- `max_seq_length`: Maximum sequence length (default: 2048)
+- Training parameters: `max_steps`, `learning_rate`, `batch_size` in SFTConfig
+
+### TTS TUI (`tts_tui.py`)
+
+**Purpose**: A terminal-based user interface for generating speech using a fine-tuned model.
+
+**How to run**:
+```bash
+python tts_tui.py
+```
+
+**What it does**:
+- Loads a fine-tuned model from `tts_lora/` or `outputs_tts/checkpoint-*/`
+- Provides an interactive command-line interface
+- Supports real-time text-to-speech generation
+- Includes advanced controls: temperature, top_k, top_p, repetition penalty, silence trim
+- Saves generated audio to `output_tui/`
+
+**Available commands** (type in the input box):
+- `/temp <float>` - Set temperature (controls randomness)
+- `/top_k <int>` - Set top-k sampling
+- `/top_p <float>` - Set top-p (nucleus) sampling
+- `/trim <float>` - Set silence trim threshold (default 0.03)
+- `/model <path>` - Load a different model/checkpoint
+- `/help` - Show all available commands
+
+**Keyboard shortcuts**:
+- `Ctrl+Q` - Quit the application
+- `Ctrl+C` - Clear the log
+
+### TTS Gradio Interface (`tts_gradio.py`)
+
+**Purpose**: A web-based Gradio interface for generating speech using a fine-tuned model.
+
+**How to run**:
+```bash
+python tts_gradio.py
+```
+
+**What it does**:
+- Provides a user-friendly web UI for TTS generation
+- Supports all the same features as the TUI
+- Generates a shareable link for remote access
+- Includes sliders for all generation parameters
+- Displays generated audio directly in the browser
+
+**Parameters available in the UI**:
+- **Temperature**: Controls randomness (0.1 - 1.5)
+- **Top-K**: Limits token choices to top K candidates (1 - 200)
+- **Top-P**: Nucleus sampling threshold (0.0 - 1.0)
+- **Repetition Penalty**: Penalizes repeated tokens (1.0 - 2.0)
+- **Silence Trim Threshold**: Cuts trailing silence (0.0 - 0.1)
+
+### Inference Script (`inference.py`)
+
+**Purpose**: A simple command-line script for generating speech using a fine-tuned model.
+
+**How to run**:
+```bash
+python inference.py
+```
+
+**What it does**:
+- Loads a fine-tuned model from `tts_lora/` or a checkpoint path
+- Generates speech from a pre-configured input text
+- Saves the output audio to `generated.wav`
+
+**Configuration**:
+Edit the following variables in the script:
+- `LORA_PATH`: Path to LoRA adapters (default: `outputs_tts/checkpoint-1200`)
+- `INPUT_TEXT`: Text to convert to speech
+- `OUTPUT_FILENAME`: Output audio filename (default: `generated.wav`)
+
 ## 🛠️ Setup & Installation
 
 <details>
@@ -95,9 +192,16 @@ You can control which parts of the pipeline run, useful for debugging or reproce
 
 ```yaml
 pipeline_control:
-  run_only_stage: "ctc_align"      # Run specific stage only
-  start_stage: "llm_diarize"       # Start from specific stage  
-  end_stage: "outlier_detect"      # Stop at specific stage
+  run_only_stage: "ctc_aligner"      # Run specific stage only (alias: ctc_align)
+  start_stage: "llm_diarizer"        # Start from specific stage (alias: llm_diarize)
+  end_stage: "outlier_detector"      # Stop at specific stage (alias: outlier_detect)
+```
+
+CTC alignment can also be parallelized across episodes (each worker loads its own model copy on the GPU):
+
+```yaml
+ctc_aligner:
+  num_workers: 4
 ```
 
 </details>
@@ -116,6 +220,10 @@ TTSizer/
 │   │── core/                       # Core components of the pipeline
 │   ├── models/                     # Vocal removal models
 │   └── utils/                      # Utility programs
+├── finetune.py                     # Script to fine-tune Spark-TTS model
+├── inference.py                    # Simple command-line TTS inference
+├── tts_tui.py                      # Terminal-based TTS inference UI
+├── tts_gradio.py                   # Web-based TTS inference UI (Gradio)
 ├── .env                            # For API keys
 ├── README.md                       # This file
 ├── requirements.txt                # Python package dependencies

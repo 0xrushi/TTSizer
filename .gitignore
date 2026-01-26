@@ -3,4 +3,16 @@ __pycache__/
 weights
 data
 logs
+.gradio/
+
 sample/
+Makefile
+generate_metadata.py
+unsloth_compiled_cache/
+Spark-TTS-0.5B/
+output_*
+outputs_*
+*.whl
+peter_griffin_lora/
+orpheus_150m_lora/
+configs/config copy.yaml

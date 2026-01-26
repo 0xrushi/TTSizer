@@ -36,6 +36,27 @@ STAGES = [
     "asr_processor"
 ]
 
+STAGE_ALIASES = {
+    # Backwards-compatible / doc-friendly aliases
+    "audio_extract": "audio_extractor",
+    "vocals_extract": "vocals_extractor",
+    "vocals_normalize": "vocals_normalizer",
+    "llm_diarize": "llm_diarizer",
+    "ctc_align": "ctc_aligner",
+    "outlier_detect": "outlier_detector",
+    "asr_process": "asr_processor",
+}
+
+def _normalize_stage_name(stage_name: Any) -> Optional[str]:
+    if stage_name is None:
+        return None
+    if not isinstance(stage_name, str):
+        return None
+    stage_name = stage_name.strip()
+    if not stage_name:
+        return None
+    return STAGE_ALIASES.get(stage_name, stage_name)
+
 class PipelineOrchestrator:
     """Manages and executes the TTSizer processing pipeline stages."""
     def __init__(self, cfg_path_str: str):
@@ -273,21 +294,55 @@ class PipelineOrchestrator:
 
     def run(self):
         """Runs the configured pipeline stages based on pipeline_control settings."""
-        run_only = self.pipeline_control.get("run_only_stage")
-        start_stage = self.pipeline_control.get("start_stage")
-        end_stage = self.pipeline_control.get("end_stage")
+        run_only_raw = self.pipeline_control.get("run_only_stage")
+        start_stage_raw = self.pipeline_control.get("start_stage")
+        end_stage_raw = self.pipeline_control.get("end_stage")
+
+        run_only = _normalize_stage_name(run_only_raw)
+        start_stage = _normalize_stage_name(start_stage_raw)
+        end_stage = _normalize_stage_name(end_stage_raw)
+
+        if run_only_raw and run_only and run_only_raw != run_only:
+            logger.info(f"Normalized run_only_stage '{run_only_raw}' -> '{run_only}'")
+        if start_stage_raw and start_stage and start_stage_raw != start_stage:
+            logger.info(f"Normalized start_stage '{start_stage_raw}' -> '{start_stage}'")
+        if end_stage_raw and end_stage and end_stage_raw != end_stage:
+            logger.info(f"Normalized end_stage '{end_stage_raw}' -> '{end_stage}'")
 
         active_stages = []
 
         if run_only:
             if run_only not in STAGES:
-                logger.error(f"Stage '{run_only}' in 'run_only_stage' is not a valid stage name.")
+                logger.error(
+                    f"Stage '{run_only_raw}' (normalized to '{run_only}') in 'run_only_stage' is not a valid stage name. "
+                    f"Valid stages: {STAGES}. Aliases: {sorted(STAGE_ALIASES.keys())}"
+                )
                 return
             if run_only not in self.runners:
                 logger.error(f"Runner for stage '{run_only}' not implemented.")
                 return
             active_stages = [run_only]
         else:
+            if start_stage_raw and not start_stage:
+                logger.error(f"'start_stage' must be a non-empty string or null; got {type(start_stage_raw).__name__}.")
+                return
+            if end_stage_raw and not end_stage:
+                logger.error(f"'end_stage' must be a non-empty string or null; got {type(end_stage_raw).__name__}.")
+                return
+
+            if start_stage and start_stage not in STAGES:
+                logger.error(
+                    f"Stage '{start_stage_raw}' (normalized to '{start_stage}') in 'start_stage' is not a valid stage name. "
+                    f"Valid stages: {STAGES}. Aliases: {sorted(STAGE_ALIASES.keys())}"
+                )
+                return
+            if end_stage and end_stage not in STAGES:
+                logger.error(
+                    f"Stage '{end_stage_raw}' (normalized to '{end_stage}') in 'end_stage' is not a valid stage name. "
+                    f"Valid stages: {STAGES}. Aliases: {sorted(STAGE_ALIASES.keys())}"
+                )
+                return
+
             start_index = STAGES.index(start_stage) if start_stage and start_stage in STAGES else 0
             end_index = STAGES.index(end_stage) if end_stage and end_stage in STAGES else len(STAGES) - 1
             

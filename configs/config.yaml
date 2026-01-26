@@ -7,14 +7,14 @@ project_setup:
   target_speaker_labels: ["Makima", "Power"]                  # List of target speaker names
 
 pipeline_control:
-  run_only_stage: null            # e.g., "vocals_extract" (runs only this stage), null to disable
-  start_stage: null               # e.g., "llm_diarize" (starts processing from this stage), null to disable
-  end_stage: null                 # e.g., "ctc_align" (ends processing after this stage), null to disable
+  run_only_stage: null            # e.g., "vocals_extractor" (runs only this stage), null to disable (aliases supported)
+  start_stage: null          # e.g., "llm_diarizer" (starts processing from this stage), null to disable (aliases supported)
+  end_stage: null                 # e.g., "ctc_aligner" (ends processing after this stage), null to disable (aliases supported)
 
 # 1. Audio Extraction from Video
 audio_extractor:
   output_folder: "audio"
-  preferred_lang_codes: ["eng", "en", "english"] # Preferred audio stream language codes
+  preferred_lang_codes: ["hin", "hi", "eng", "en"] # Preferred audio stream language codes
   max_workers: 2
   output_sample_rate: 44100
   output_codec: "flac"
@@ -83,6 +83,7 @@ ctc_aligner:
   output_folder: "aligned_clips"
   language_code: "en"                 # Language code for text preprocessing
   batch_size: 8
+  num_workers: 4                      # Parallel episode workers (each loads its own CTC model on GPU; increase to use more VRAM)
   use_gpu: true
   start_pad_seconds: 0.4              # Padding added to the start of audio segments before alignment
   end_pad_seconds: 0.7                # Padding added to the end of audio segments before alignment
