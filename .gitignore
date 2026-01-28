@@ -16,3 +16,60 @@ outputs_*
 peter_griffin_lora/
 orpheus_150m_lora/
 configs/config copy.yaml
+# NOTE: don't ignore all configs; keep the canonical configs in git.
+# Ignore only local/private overrides and editor swap files.
+configs/*local*.yaml
+configs/*private*.yaml
+configs/*secret*.yaml
+configs/*copy*.yaml
+tts_dataset_output/*
+shark_tank_india_season_1/*
+
+# Vendored/large external repos (avoid accidental massive commits)
+xformers/
+Spark-TTS/
+
+# Generated dataset artifacts (large, reproducible)
+*.parquet
+*.json
+
+
+# HuggingFace cache dirs (datasets/models) and lock files
+**/.hf_cache/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Logs & artifacts
+*.log
+*.tmp
+
+# Audio / media artifacts (generated)
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.mp4
+*.mkv
+
+# Model / checkpoint artifacts
+*.ckpt
+*.safetensors
+*.pt
+*.bin
